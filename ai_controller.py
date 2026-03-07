@@ -6,8 +6,20 @@ from google import genai
 from google.genai import types
 
 # --- CONFIGURATION ---
-API_KEY = "AIzaSyBhq5PJGzKj0QnTbBG2BImV_AGeejDwGFw"
-PI_IP_ADDRESS = "192.168.1.116"  # Update this to your Pi Zero's IP
+def _load_secrets(path="secrets.txt"):
+    secrets = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, _, value = line.partition("=")
+            secrets[key.strip()] = value.strip()
+    return secrets
+
+_secrets = _load_secrets()
+API_KEY       = _secrets["API_KEY"]
+PI_IP_ADDRESS = _secrets["PI_IP_ADDRESS"]
 CAPTURE_DEVICE_INDEX = 1         # Changed to 1 since /dev/video0 does not exist
 
 SCREEN_WIDTH = 1920
