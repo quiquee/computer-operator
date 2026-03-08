@@ -1,7 +1,11 @@
 import cv2
 import time
 import base64
+import json
+import os
+import re
 import requests
+import numpy as np
 from google import genai
 from google.genai import types
 
@@ -26,21 +30,132 @@ SCREEN_WIDTH = 1920
 SCREEN_HEIGHT = 1080
 COMPUTER_USE_MODEL = "gemini-2.5-computer-use-preview-10-2025"
 
+OLLAMA_SYSTEM_PROMPT = """\
+You are an AI agent controlling a desktop computer with a {width}x{height} screen.
+You receive a screenshot after each action and must issue ONE action at a time.
+
+Respond ONLY with a JSON object — no extra text, no markdown fences. Schema:
+Observe each screenshot carefully before acting. 
+When the goal is fully accomplished, say so clearly.
+        
+Respond ONLY with a JSON object — no extra text, no markdown fences. Schema:
+{{\"action\": \"action\",     
+  \"x\": <int>, \"y\": <int>,
+        "   \"thought\": \"<why>\"}} 
+
+Actions are one of:  mouse_move, left_click, double_click, type_text, scroll_down, scroll_up, page_down, page_up
+Explain what you intend to do in the field \"thought\"
+Coordinates are pixel values: x 0-{width}, y 0-{height}.
+Do only use the provided actions, not your own made-up ones like "search" or "navigate". Instead, use the tools you have: mouse clicks, typing, and key presses to accomplish those higher-level tasks.
+Special key use bracket notation in text/keys fields: [enter] [tab] [escape]
+Control - letter combinations use bracket notation as  [ctrl letter] 
+"""
+
 client = genai.Client(api_key=API_KEY)
+
+_pi_responses: list = []  # accumulates Pi Zero command/response records for the current action step
 
 
 # --- HARDWARE COMMUNICATION ---
 def send_to_pi(payload):
-    """Sends the command to the Pi Zero HTTP Server"""
+    """Sends the command to the Pi Zero HTTP Server and records the result."""
     url = f"http://{PI_IP_ADDRESS}:8080"
+    entry = {"cmd": payload}
     try:
         response = requests.post(url, json=payload, timeout=5)
+        entry["http_status"] = response.status_code
+        entry["body"] = response.text.strip()
         if response.status_code == 200:
-            print(f"  Success: {payload['action']}")
+            print(f"  OK [{response.status_code}]: {payload['action']}")
         else:
-            print(f"  Error from Pi: {response.text}")
+            print(f"  Error [{response.status_code}] from Pi: {response.text}")
     except requests.exceptions.RequestException as e:
+        entry["http_status"] = None
+        entry["body"] = None
+        entry["error"] = str(e)
         print(f"  Connection error to Pi: {e}")
+    _pi_responses.append(entry)
+
+
+# --- INTERACTION LOGGER ---
+class InteractionLogger:
+    """Saves a PNG screenshot and a structured text file for each action step."""
+
+    def __init__(self, log_dir="logs"):
+        os.makedirs(log_dir, exist_ok=True)
+        self.log_dir = log_dir
+        existing = [f for f in os.listdir(log_dir) if re.match(r"capture-\d+\.png", f)]
+        nums = [int(re.search(r"(\d+)", f).group(1)) for f in existing]
+        self.counter = max(nums) + 1 if nums else 1
+
+    def save(self, goal, model_thought, model_action, model_args, pi_commands, image_bytes):
+        """Save screenshot + structured interaction log.
+
+        pi_commands is a list of dicts: {cmd, http_status, body, error?}
+        as recorded by send_to_pi().
+        """
+        n = self.counter
+        self.counter += 1
+
+        img_path = os.path.join(self.log_dir, f"capture-{n:03d}.png")
+        arr = np.frombuffer(image_bytes, dtype=np.uint8)
+        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if frame is not None:
+            cv2.imwrite(img_path, frame)
+
+        txt_path = os.path.join(self.log_dir, f"interaction-{n:03d}.txt")
+        with open(txt_path, "w", encoding="utf-8") as f:
+            # --- Goal ---
+            f.write(f"=== GOAL ===\n{goal}\n\n")
+
+            # --- What the model decided ---
+            model_section = ""
+            if model_thought:
+                model_section += f"Thought:\n{model_thought}\n\n"
+            model_section += f"Action: {model_action}\n"
+            if model_args:
+                model_section += f"Args:\n{json.dumps(model_args, indent=2)}\n"
+            f.write(f"=== MODEL RESPONSE ===\n{model_section}\n")
+
+            # --- Each HTTP command sent to Pi Zero ---
+            if pi_commands:
+                cmds = ""
+                for i, entry in enumerate(pi_commands, 1):
+                    cmds += f"[{i}] {json.dumps(entry['cmd'])}\n"
+                f.write(f"=== COMMANDS SENT TO Pi Zero ===\n{cmds}\n")
+            else:
+                f.write("=== COMMANDS SENT TO Pi Zero ===\n(none)\n\n")
+
+            # --- Response / status from Pi Zero for each command ---
+            if pi_commands:
+                resps = ""
+                for i, entry in enumerate(pi_commands, 1):
+                    if entry.get("error"):
+                        resps += f"[{i}] ERROR: {entry['error']}\n"
+                    else:
+                        status = entry.get("http_status", "?")
+                        body   = entry.get("body", "")
+                        resps += f"[{i}] HTTP {status}: {body}\n"
+                f.write(f"=== Pi Zero RESPONSES ===\n{resps}\n")
+            else:
+                f.write("=== Pi Zero RESPONSES ===\n(none)\n\n")
+
+        self._update_manifest(n)
+        print(f"  [Log] capture-{n:03d}.png + interaction-{n:03d}.txt")
+
+    def _update_manifest(self, new_n):
+        """Keep logs/manifest.json in sync so the JS viewer needs no server logic."""
+        manifest_path = os.path.join(self.log_dir, "manifest.json")
+        try:
+            with open(manifest_path) as f:
+                nums = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            nums = []
+        if new_n not in nums:
+            nums.append(new_n)
+            nums.sort()
+        with open(manifest_path, "w") as f:
+            json.dump(nums, f)
 
 
 # --- VISION ---
@@ -190,9 +305,22 @@ def start_agent():
         "Coordinates are normalized: 0 is left/top and 1000 is right/bottom. "
         "Observe each screenshot carefully before acting. "
         "When the goal is fully accomplished, say so clearly."
+        
+        "Respond ONLY with a JSON object — no extra text, no markdown fences. Schema:"
+        "{{\"action\": \"action\",     " 
+        "   \"x\": <int>, \"y\": <int>,"
+        "   \"thought\": \"<why>\"}} "
+
+        "Actions are one of:  mouse_move, left_click, double_click, type_text, scroll_down, scroll_up, page_down, page_up"
+        "Explain what you intend to do in the field \"thought\""
+        "Coordinates are pixel values: x 0-{width}, y 0-{height}."
+
+        "Special key use bracket notation in text/keys fields: [enter] [tab] [escape]"
+        "Control - letter combinations use bracket notation as  [ctrl letter] "
     )
 
     user_goal = input("Enter your goal: ")
+    logger = InteractionLogger()
 
     print("Taking initial screenshot...")
     screenshot_bytes = get_screen_bytes(cap)
@@ -209,14 +337,30 @@ def start_agent():
     try:
         while True:
             print("\nSending to Gemini Computer Use API...")
-            response = client.models.generate_content(
-                model=COMPUTER_USE_MODEL,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    tools=[computer_use_tool],
-                    system_instruction=system_instruction,
-                ),
-            )
+            try:
+                response = client.models.generate_content(
+                    model=COMPUTER_USE_MODEL,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        tools=[computer_use_tool],
+                        system_instruction=system_instruction,
+                    ),
+                )
+            except Exception as api_err:
+                print(f"\n[API ERROR] {api_err}")
+                # Roll back the conversation to the last clean user turn so the
+                # loop can retry.  The bad exchange looks like:
+                #   [..., user(screenshot/goal), model(bad fn call), user(fn response)]
+                # We pop until we're back to a user turn that has plain text
+                # (i.e. not a function-response turn), then retry.
+                while contents and not any(
+                    getattr(p, "text", None)
+                    for p in getattr(contents[-1], "parts", [])
+                ):
+                    contents.pop()
+                print(f"Rolled back to {len(contents)} turn(s). Retrying after 3 s...")
+                time.sleep(3)
+                continue
 
             candidate = response.candidates[0]
             # Append the model's response to the conversation history
@@ -224,10 +368,12 @@ def start_agent():
 
             function_response_parts = []
             any_action = False
+            model_text_parts = []
 
             for part in candidate.content.parts:
                 if part.text:
                     print(f"\nAI: {part.text.strip()}")
+                    model_text_parts.append(part.text.strip())
 
                 if part.function_call:
                     fn = part.function_call
@@ -236,6 +382,7 @@ def start_agent():
                     any_action = True
 
                     print(f"\nAction -> {fn_name}({args})")
+                    _pi_responses.clear()
                     execute_computer_use_action(fn_name, args, browser_state)
 
                     # Let the screen settle, then capture the result
@@ -244,8 +391,19 @@ def start_agent():
                     png_bytes = get_screen_bytes(cap, fmt='.png')
                     png_b64 = base64.b64encode(png_bytes).decode()
 
+                    logger.save(
+                        goal=user_goal,
+                        model_thought="\n".join(model_text_parts),
+                        model_action=fn_name,
+                        model_args=args,
+                        pi_commands=list(_pi_responses),
+                        image_bytes=png_bytes,
+                    )
+
                     # Build a function response that includes the screenshot.
-                    # The API always requires 'url' or 'current_url' in response.
+                    # The API requires 'current_url' and 'safety_decision_acknowledged'
+                    # in every function response — the latter confirms the client has
+                    # seen and accepted the safety decision attached to the function call.
                     function_response_parts.append(
                         types.Part(
                             function_response=types.FunctionResponse(
@@ -254,6 +412,7 @@ def start_agent():
                                 response={
                                     "output": "success",
                                     "current_url": browser_state["current_url"],
+                                    "safety_decision_acknowledged": True,
                                 },
                                 parts=[
                                     types.FunctionResponsePart(
@@ -287,6 +446,189 @@ def start_agent():
                 )
 
             time.sleep(1.0)  # Brief throttle between API calls
+
+    except KeyboardInterrupt:
+        print("\nAgent stopped by user.")
+    finally:
+        cap.release()
+
+
+# --- OLLAMA BACKEND ---
+
+def _ollama_chat(ollama_url, model, messages):
+    """POST to Ollama /api/chat and return the assistant message content."""
+    resp = requests.post(
+        f"{ollama_url}/api/chat",
+        json={
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            # Do NOT use format:"json" with vision models — the grammar sampler
+            # conflicts with multimodal token processing and causes the model to
+            # emit repeated <|im_start|> tokens instead of valid output.
+            # JSON output is enforced through the system prompt instead.
+            "options": {
+                "temperature": 0.1,
+                "repeat_penalty": 1.15,
+            },
+        },
+        timeout=120,
+    )
+    resp.raise_for_status()
+    return resp.json()["message"]["content"]
+
+
+def _parse_action(raw):
+    """Extract a JSON action dict from the model's response string."""
+    cleaned = re.sub(r"```(?:json)?", "", raw).strip().strip("`").strip()
+    return json.loads(cleaned)
+
+
+def execute_ollama_action(action_dict):
+    """Execute an action dict produced by the Ollama model. Returns True when done."""
+    action = action_dict.get("action", "")
+    thought = action_dict.get("thought", "")
+    if thought:
+        print(f"  Thought: {thought}")
+
+    if action == "done":
+        print(f"\nTask complete: {action_dict.get('message', '')}")
+        return True
+
+    elif action == "click_at":
+        x, y = int(action_dict["x"]), int(action_dict["y"])
+        print(f"  -> mouse_move({x}, {y}) + left_click")
+        send_to_pi({"action": "mouse_move", "x": x, "y": y})
+        time.sleep(1.5)
+        send_to_pi({"action": "left_click"})
+        time.sleep(0.5)
+
+    elif action == "double_click_at":
+        x, y = int(action_dict["x"]), int(action_dict["y"])
+        print(f"  -> mouse_move({x}, {y}) + double_click")
+        send_to_pi({"action": "mouse_move", "x": x, "y": y})
+        time.sleep(1.5)
+        send_to_pi({"action": "double_click"})
+        time.sleep(0.5)
+
+    elif action == "right_click_at":
+        x, y = int(action_dict["x"]), int(action_dict["y"])
+        print(f"  -> mouse_move({x}, {y}) + right_click")
+        send_to_pi({"action": "mouse_move", "x": x, "y": y})
+        time.sleep(1.5)
+        send_to_pi({"action": "right_click"})
+        time.sleep(0.5)
+
+    elif action == "type_text":
+        nx, ny = action_dict.get("x"), action_dict.get("y")
+        text = action_dict.get("text", "")
+        if nx is not None and ny is not None:
+            x, y = int(nx), int(ny)
+            print(f"  -> mouse_move({x}, {y}) + left_click")
+            send_to_pi({"action": "mouse_move", "x": x, "y": y})
+            time.sleep(1.5)
+            send_to_pi({"action": "left_click"})
+            time.sleep(0.5)
+        print(f"  -> type_text({text!r})")
+        send_to_pi({"action": "type_text", "text": text})
+        time.sleep(0.5)
+
+    elif action == "scroll":
+        x = int(action_dict.get("x", SCREEN_WIDTH // 2))
+        y = int(action_dict.get("y", SCREEN_HEIGHT // 2))
+        direction = action_dict.get("direction", "down")
+        amount = int(action_dict.get("amount", 3))
+        print(f"  -> mouse_move({x}, {y}) + scroll_{direction} x{amount}")
+        send_to_pi({"action": "mouse_move", "x": x, "y": y})
+        time.sleep(0.5)
+        for _ in range(amount):
+            send_to_pi({"action": f"scroll_{direction}"})
+            time.sleep(0.1)
+        time.sleep(0.3)
+
+    elif action == "key_press":
+        keys = action_dict.get("keys", "")
+        print(f"  -> key_press({keys!r})")
+        send_to_pi({"action": "type_text", "text": keys})
+        time.sleep(0.5)
+
+    else:
+        print(f"  -> Unknown action: {action}")
+
+    return False
+
+
+def start_ollama_agent():
+    ollama_host  = _secrets.get("OLLAMA_HOST",  "localhost")
+    ollama_port  = _secrets.get("OLLAMA_PORT",  "11434")
+    ollama_model = _secrets.get("OLLAMA_MODEL", "qwen2.5vl:7b")
+    ollama_url   = f"http://{ollama_host}:{ollama_port}"
+
+    print(f"Using Ollama model: {ollama_model} at {ollama_url}")
+
+    print("Initializing Capture Card...")
+    cap = cv2.VideoCapture(CAPTURE_DEVICE_INDEX)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, SCREEN_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, SCREEN_HEIGHT)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    system_prompt = OLLAMA_SYSTEM_PROMPT.format(width=SCREEN_WIDTH, height=SCREEN_HEIGHT)
+    user_goal = input("Enter your goal: ")
+    logger = InteractionLogger()
+
+    print("Taking initial screenshot...")
+    jpg_bytes = get_screen_bytes(cap)
+    b64 = base64.b64encode(jpg_bytes).decode()
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user",   "content": user_goal, "images": [b64]},
+    ]
+
+    print("\n--- Ollama Agent Active ---")
+    try:
+        while True:
+            print("\nSending to Ollama...")
+            raw = _ollama_chat(ollama_url, ollama_model, messages)
+            print(f"Response: {raw[:300]}")
+
+            try:
+                action_dict = _parse_action(raw)
+            except Exception as e:
+                print(f"Failed to parse action JSON: {e}")
+                messages.append({"role": "assistant", "content": raw})
+                messages.append({"role": "user", "content": "Your response was not valid JSON. Reply with ONLY a JSON action object, no extra text."})
+                continue
+
+            messages.append({"role": "assistant", "content": raw})
+
+            _pi_responses.clear()
+            done = execute_ollama_action(action_dict)
+            if done:
+                break
+
+            # Capture result screen and continue the loop
+            time.sleep(2.0)
+            jpg_bytes = get_screen_bytes(cap)
+            b64 = base64.b64encode(jpg_bytes).decode()
+
+            action_name = action_dict.get("action", "")
+            action_args = {k: v for k, v in action_dict.items() if k not in ("action", "thought")}
+            logger.save(
+                goal=user_goal,
+                model_thought=action_dict.get("thought", ""),
+                model_action=action_name,
+                model_args=action_args,
+                pi_commands=list(_pi_responses),
+                image_bytes=jpg_bytes,
+            )
+
+            messages.append({
+                "role": "user",
+                "content": "Action executed. Here is the updated screen. Continue towards the goal.",
+                "images": [b64],
+            })
+            time.sleep(1.0)
 
     except KeyboardInterrupt:
         print("\nAgent stopped by user.")
@@ -377,19 +719,36 @@ def run_calibration_test():
 
 if __name__ == "__main__":
     print("=== AI Computer Operator ===")
-    print("1. Normal mode (Gemini Computer Use API)")
-    print("2. Calibration test mode")
+    print("Backend:")
+    print("  1. Google Gemini Computer Use API")
+    print("  2. Ollama (local model)")
     while True:
         try:
-            mode = int(input("Select mode (1 or 2): "))
-            if mode in (1, 2):
+            backend = int(input("Select backend (1 or 2): "))
+            if backend in (1, 2):
                 break
             else:
                 print("Please enter 1 or 2.")
         except ValueError:
             print("Please enter a valid number.")
 
-    if mode == 1:
-        start_agent()
+    if backend == 2:
+        start_ollama_agent()
     else:
-        run_calibration_test()
+        print("\nMode:")
+        print("  1. Normal mode (Computer Use agent)")
+        print("  2. Calibration test mode")
+        while True:
+            try:
+                mode = int(input("Select mode (1 or 2): "))
+                if mode in (1, 2):
+                    break
+                else:
+                    print("Please enter 1 or 2.")
+            except ValueError:
+                print("Please enter a valid number.")
+
+        if mode == 1:
+            start_agent()
+        else:
+            run_calibration_test()

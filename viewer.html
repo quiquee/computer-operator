@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Computer Operator — Interaction Viewer</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: 'Consolas', 'Courier New', monospace;
+    background: #0d0d1a; color: #d4d4d8;
+    height: 100vh; display: flex; flex-direction: column; overflow: hidden;
+  }
+
+  /* Header */
+  header {
+    background: #13131f; border-bottom: 1px solid #2a2a3e;
+    padding: 10px 20px; display: flex; align-items: center; gap: 16px; flex-shrink: 0;
+  }
+  header h1 { font-size: 1rem; color: #7c6af7; letter-spacing: 0.05em; white-space: nowrap; }
+
+  .nav { display: flex; gap: 8px; align-items: center; }
+  .nav button {
+    background: #1e1e34; color: #d4d4d8; border: 1px solid #3a3a5c;
+    padding: 6px 14px; cursor: pointer; border-radius: 4px; font-size: 0.82rem;
+    transition: background 0.15s, border-color 0.15s;
+  }
+  .nav button:hover:not(:disabled) { background: #7c6af7; border-color: #7c6af7; color: #fff; }
+  .nav button:disabled { opacity: 0.3; cursor: default; }
+
+  .counter { color: #888; font-size: 0.85rem; min-width: 72px; text-align: center; }
+  .spacer  { flex: 1; }
+
+  .auto-lbl {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 0.82rem; color: #888; cursor: pointer; user-select: none;
+  }
+  .auto-lbl input { accent-color: #7c6af7; }
+
+  /* Main layout */
+  main { display: flex; flex: 1; overflow: hidden; }
+
+  .img-panel {
+    flex: 3; background: #000;
+    display: flex; align-items: center; justify-content: center; overflow: hidden;
+  }
+  #capture {
+    max-width: 100%; max-height: 100%; object-fit: contain;
+    display: none;
+  }
+  .placeholder { color: #444; font-size: 0.9rem; }
+
+  .info-panel {
+    flex: 1; min-width: 300px; max-width: 460px;
+    display: flex; flex-direction: column;
+    overflow-y: auto; border-left: 1px solid #2a2a3e; background: #0d0d1a;
+  }
+  .section { border-bottom: 1px solid #1e1e34; }
+  .section h3 {
+    font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.12em;
+    color: #7c6af7; padding: 8px 12px 3px;
+  }
+  .section pre {
+    padding: 4px 12px 10px; font-size: 0.78rem;
+    white-space: pre-wrap; word-break: break-word;
+    color: #b0b0c8; line-height: 1.55;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>&#x1F5A5; Computer Operator &mdash; Interaction Viewer</h1>
+
+  <div class="nav">
+    <button id="btnFirst" title="First (Home)">|&#9664;</button>
+    <button id="btnPrev"  title="Previous (&larr;)">&#9664;</button>
+    <span   id="counter" class="counter">&mdash; / &mdash;</span>
+    <button id="btnNext"  title="Next (&rarr;)">&#9654;</button>
+    <button id="btnLast"  title="Latest (End)">&#9654;|</button>
+  </div>
+
+  <div class="spacer"></div>
+
+  <label class="auto-lbl">
+    <input type="checkbox" id="autoRefresh"> Auto-refresh (3 s)
+  </label>
+</header>
+
+<main>
+  <div class="img-panel">
+    <img id="capture" alt="screenshot">
+    <span id="placeholder" class="placeholder">No interactions found in logs/.</span>
+  </div>
+
+  <div class="info-panel">
+    <div class="section"><h3>Goal</h3>              <pre id="txtGoal">&mdash;</pre></div>
+    <div class="section"><h3>Model Response</h3>    <pre id="txtModel">&mdash;</pre></div>
+    <div class="section"><h3>Commands &rarr; Pi Zero</h3><pre id="txtAction">&mdash;</pre></div>
+    <div class="section"><h3>Pi Zero Responses</h3>   <pre id="txtPi">&mdash;</pre></div>
+  </div>
+</main>
+
+<script>
+"use strict";
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let entries  = [];   // sorted array of interaction numbers
+let current  = 0;
+let autoTimer = null;
+
+// ── DOM ───────────────────────────────────────────────────────────────────────
+const btnFirst  = document.getElementById('btnFirst');
+const btnPrev   = document.getElementById('btnPrev');
+const btnNext   = document.getElementById('btnNext');
+const btnLast   = document.getElementById('btnLast');
+const counter   = document.getElementById('counter');
+const imgEl     = document.getElementById('capture');
+const ph        = document.getElementById('placeholder');
+const txtGoal   = document.getElementById('txtGoal');
+const txtModel  = document.getElementById('txtModel');
+const txtAction = document.getElementById('txtAction');
+const txtPi     = document.getElementById('txtPi');
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+const pad = n => String(n).padStart(3, '0');
+
+function parseSections(text) {
+  const out = {};
+  // Match  === SECTION TITLE ===\n<content>  until next section or end
+  const re = /^=== (.+?) ===\n([\s\S]*?)(?=\n=== |\s*$)/gm;
+  let m;
+  while ((m = re.exec(text)) !== null) out[m[1].trim()] = m[2].trim();
+  return out;
+}
+
+// ── Manifest: fetch logs/manifest.json written by InteractionLogger ───────────
+// Falls back to sequential HEAD probing if the file doesn't exist yet.
+async function loadManifest() {
+  try {
+    const r = await fetch('logs/manifest.json', { cache: 'no-cache' });
+    if (r.ok) return await r.json();
+  } catch (_) { /* fall through */ }
+
+  // Fallback: probe sequentially until three consecutive misses
+  const nums = [];
+  let misses = 0;
+  for (let n = 1; n <= 9999 && misses < 3; n++) {
+    const r = await fetch(`logs/capture-${pad(n)}.png`, { method: 'HEAD', cache: 'no-cache' });
+    if (r.ok) { nums.push(n); misses = 0; }
+    else      { misses++; }
+  }
+  return nums;
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+async function render() {
+  if (entries.length === 0) {
+    counter.textContent = '— / —';
+    imgEl.style.display = 'none';
+    ph.style.display    = '';
+    [btnFirst, btnPrev, btnNext, btnLast].forEach(b => b.disabled = true);
+    [txtGoal, txtModel, txtAction, txtPi].forEach(el => el.textContent = '—');
+    return;
+  }
+
+  const n = entries[current];
+  counter.textContent = `${current + 1} / ${entries.length}`;
+  btnFirst.disabled   = current === 0;
+  btnPrev.disabled    = current === 0;
+  btnNext.disabled    = current === entries.length - 1;
+  btnLast.disabled    = current === entries.length - 1;
+  ph.style.display    = 'none';
+
+  imgEl.src           = `logs/capture-${pad(n)}.png?t=${Date.now()}`;
+  imgEl.style.display = 'block';
+
+  const r = await fetch(`logs/interaction-${pad(n)}.txt`, { cache: 'no-cache' });
+  if (!r.ok) return;
+  const s = parseSections(await r.text());
+  txtGoal.textContent   = s['GOAL']                      || '—';
+  txtModel.textContent  = s['MODEL RESPONSE']            || '—';
+  txtAction.textContent = s['COMMANDS SENT TO Pi Zero']  || '—';
+  txtPi.textContent     = s['Pi Zero RESPONSES']         || '—';
+}
+
+// ── Navigation ────────────────────────────────────────────────────────────────
+function goTo(idx) {
+  current = Math.max(0, Math.min(entries.length - 1, idx));
+  render();
+}
+
+btnFirst.onclick = () => goTo(0);
+btnPrev.onclick  = () => goTo(current - 1);
+btnNext.onclick  = () => goTo(current + 1);
+btnLast.onclick  = () => goTo(entries.length - 1);
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowLeft')  goTo(current - 1);
+  if (e.key === 'ArrowRight') goTo(current + 1);
+  if (e.key === 'Home')       goTo(0);
+  if (e.key === 'End')        goTo(entries.length - 1);
+});
+
+// ── Refresh: re-read manifest and stay at latest if already at end ─────────────
+async function refresh() {
+  const atEnd  = entries.length === 0 || current === entries.length - 1;
+  entries      = await loadManifest();
+  if (atEnd && entries.length > 0) current = entries.length - 1;
+  render();
+}
+
+document.getElementById('autoRefresh').addEventListener('change', function () {
+  clearInterval(autoTimer);
+  if (this.checked) autoTimer = setInterval(refresh, 3000);
+});
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+refresh();
+</script>
+</body>
+</html>

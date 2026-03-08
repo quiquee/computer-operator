@@ -45,6 +45,26 @@ def send_absolute_mouse(buttons, x, y):
 def move_mouse_absolute(target_x, target_y):
     send_absolute_mouse(0, target_x, target_y)
 
+def send_mouse_scroll(clicks):
+    """Send a scroll-wheel event without moving the pointer.
+
+    `clicks` is a signed integer: positive = scroll up, negative = scroll down.
+    Requires the HID gadget descriptor for /dev/hidg1 to include a wheel axis
+    (6-byte report: buttons, X-low, X-high, Y-low, Y-high, wheel).
+    """
+    # Keep the current pointer position; only the wheel byte changes.
+    abs_x = int((max(0, min(1920, int(current_x))) / 1920.0) * 32767)
+    abs_y = int((max(0, min(1080, int(current_y))) / 1080.0) * 32767)
+    # Clamp wheel to signed byte range and convert to unsigned for bytes()
+    wheel = max(-127, min(127, int(clicks)))
+    report = bytes([
+        0,
+        abs_x & 0xFF, (abs_x >> 8) & 0xFF,
+        abs_y & 0xFF, (abs_y >> 8) & 0xFF,
+        wheel & 0xFF,
+    ])
+    write_report('/dev/hidg1', report)
+
 def left_click():
     send_absolute_mouse(1, current_x, current_y) # Press
     time.sleep(0.05)
@@ -237,7 +257,27 @@ class HIDServer(BaseHTTPRequestHandler):
             elif action == 'type_text':
                 print(f"Typing: {command['text']}")
                 type_text(command['text'])
-                
+            elif action == 'scroll_down':
+                clicks = int(command.get('clicks', 3))
+                print(f"Scrolling down {clicks} click(s)")
+                for _ in range(clicks):
+                    send_mouse_scroll(-1)
+                    time.sleep(0.05)
+                send_mouse_scroll(0)  # release wheel
+            elif action == 'scroll_up':
+                clicks = int(command.get('clicks', 3))
+                print(f"Scrolling up {clicks} click(s)")
+                for _ in range(clicks):
+                    send_mouse_scroll(1)
+                    time.sleep(0.05)
+                send_mouse_scroll(0)  # release wheel
+            elif action == 'page_down':
+                print("Page Down")
+                type_text('[pagedown]')
+            elif action == 'page_up':
+                print("Page Up")
+                type_text('[pageup]')
+
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b'{"status":"success"}')
